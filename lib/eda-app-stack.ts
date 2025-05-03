@@ -8,6 +8,7 @@ import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as sns from "aws-cdk-lib/aws-sns";
 import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
 import * as iam from "aws-cdk-lib/aws-iam";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 
 import { Construct } from "constructs";
 // import * as sqs from 'aws-cdk-lib/aws-sqs';
@@ -22,80 +23,174 @@ export class EDAAppStack extends cdk.Stack {
       publicReadAccess: false,
     });
 
-    // Integration infrastructure
+    const imageTable = new dynamodb.Table(this, "ImageTable", {
+      partitionKey: { name: "id", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
 
-    const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
+    const imageProcessDLQ = new sqs.Queue(this, "img-process-dlq", {
       receiveMessageWaitTime: cdk.Duration.seconds(5),
     });
 
-    //  mailerQ 
-    const mailerQ = new sqs.Queue(this, "mailer-queue", {
+    const imageProcessQueue = new sqs.Queue(this, "img-created-queue", {
+      receiveMessageWaitTime: cdk.Duration.seconds(5),
+      deadLetterQueue: {
+        queue: imageProcessDLQ,
+        maxReceiveCount: 3,
+      },
+    });
+
+    const mailerQueue = new sqs.Queue(this, "mailer-queue", {
       receiveMessageWaitTime: cdk.Duration.seconds(10),
     });
 
-    // SNS Topic
-    const newImageTopic = new sns.Topic(this, "NewImageTopic", {
-      displayName: "New Image topic",
+    const galleryTopic = new sns.Topic(this, "GalleryTopic", {
+      displayName: "Photo Gallery Events",
     });
 
-    // Lambda functions
-
-    const processImageFn = new lambdanode.NodejsFunction(
+    const logImageFn = new lambdanode.NodejsFunction(
       this,
-      "ProcessImageFn",
+      "LogImageFunction",
       {
-        runtime: lambda.Runtime.NODEJS_22_X,
-        entry: `${__dirname}/../lambdas/processImage.ts`,
+        runtime: lambda.Runtime.NODEJS_20_X,
+        entry: `${__dirname}/../lambdas/logImage.ts`,
         timeout: cdk.Duration.seconds(15),
         memorySize: 128,
+        environment: {
+          TABLE_NAME: imageTable.tableName,
+          BUCKET_NAME: imagesBucket.bucketName,
+        },
       }
     );
 
-    // mailerFn Lambda
-    const mailerFn = new lambdanode.NodejsFunction(this, "mailer-function", {
-      runtime: lambda.Runtime.NODEJS_16_X,
-      memorySize: 1024,
-      timeout: cdk.Duration.seconds(3),
-      entry: `${__dirname}/../lambdas/mailer.ts`,
-    });
+    const removeImageFn = new lambdanode.NodejsFunction(
+      this,
+      "RemoveImageFunction",
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        entry: `${__dirname}/../lambdas/removeImage.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+        environment: {
+          BUCKET_NAME: imagesBucket.bucketName,
+        },
+      }
+    );
 
-    // S3 --> SNS
+    const addMetadataFn = new lambdanode.NodejsFunction(
+      this,
+      "AddMetadataFunction",
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        entry: `${__dirname}/../lambdas/addMetadata.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+        environment: {
+          TABLE_NAME: imageTable.tableName,
+        },
+      }
+    );
+
+    const updateStatusFn = new lambdanode.NodejsFunction(
+      this,
+      "UpdateStatusFunction",
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        entry: `${__dirname}/../lambdas/updateStatus.ts`,
+        timeout: cdk.Duration.seconds(15),
+        memorySize: 128,
+        environment: {
+          TABLE_NAME: imageTable.tableName,
+        },
+      }
+    );
+
+    const mailerFn = new lambdanode.NodejsFunction(
+      this,
+      "StatusMailerFunction",
+      {
+        runtime: lambda.Runtime.NODEJS_20_X,
+        memorySize: 256,
+        timeout: cdk.Duration.seconds(10),
+        entry: `${__dirname}/../lambdas/statusMailer.ts`,
+        environment: {
+          TABLE_NAME: imageTable.tableName,
+        },
+      }
+    );
+
     imagesBucket.addEventNotification(
       s3.EventType.OBJECT_CREATED,
-      new s3n.SnsDestination(newImageTopic)
+      new s3n.SnsDestination(galleryTopic)
     );
 
-    // SNS --> SQS
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue)
+    galleryTopic.addSubscription(
+      new subs.SqsSubscription(imageProcessQueue, {
+        filterPolicy: {
+          eventType: sns.SubscriptionFilter.stringFilter({
+            allowlist: ["ObjectCreated:Put", "ObjectCreated:Post"],
+          }),
+        },
+      })
     );
 
-    //  SNS --> mailerQ
-    newImageTopic.addSubscription(
-      new subs.SqsSubscription(mailerQ)
+    galleryTopic.addSubscription(
+      new subs.LambdaSubscription(addMetadataFn, {
+        filterPolicy: {
+          "metadata_type": sns.SubscriptionFilter.stringFilter({
+            allowlist: ["Caption", "Date", "name"],
+          }),
+        },
+      })
     );
 
-    // SQS --> Lambda
-    const newImageEventSource = new events.SqsEventSource(imageProcessQueue, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
+    galleryTopic.addSubscription(
+      new subs.LambdaSubscription(updateStatusFn, {
+        filterPolicy: {
+          "MessageAttributes.update": sns.SubscriptionFilter.existsFilter(),
+        },
+      })
+    );
 
-    processImageFn.addEventSource(newImageEventSource);
+    logImageFn.addEventSource(
+      new events.SqsEventSource(imageProcessQueue, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
 
-    // mailerQ --> mailerFn
-    const newImageMailEventSource = new events.SqsEventSource(mailerQ, {
-      batchSize: 5,
-      maxBatchingWindow: cdk.Duration.seconds(5),
-    });
+    removeImageFn.addEventSource(
+      new events.SqsEventSource(imageProcessDLQ, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
 
-    mailerFn.addEventSource(newImageMailEventSource);
+    mailerFn.addEventSource(
+      new events.SqsEventSource(mailerQueue, {
+        batchSize: 5,
+        maxBatchingWindow: cdk.Duration.seconds(5),
+      })
+    );
 
-    // Permissions
+    galleryTopic.addSubscription(
+      new subs.SqsSubscription(mailerQueue, {
+        filterPolicy: {
+          "MessageAttributes.status": sns.SubscriptionFilter.stringFilter({
+            allowlist: ["Pass", "Reject"],
+          }),
+        },
+      })
+    );
 
-    imagesBucket.grantRead(processImageFn);
+    imagesBucket.grantRead(logImageFn);
+    imagesBucket.grantReadWrite(removeImageFn);
+    imageTable.grantReadWriteData(logImageFn);
+    imageTable.grantReadWriteData(addMetadataFn);
+    imageTable.grantReadWriteData(updateStatusFn);
+    imageTable.grantReadData(mailerFn);
 
-    //  SES mailerFn
     mailerFn.addToRolePolicy(
       new iam.PolicyStatement({
         effect: iam.Effect.ALLOW,
@@ -108,10 +203,16 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    // Output
-
-    new cdk.CfnOutput(this, "bucketName", {
+    new cdk.CfnOutput(this, "BucketName", {
       value: imagesBucket.bucketName,
+    });
+
+    new cdk.CfnOutput(this, "TableName", {
+      value: imageTable.tableName,
+    });
+
+    new cdk.CfnOutput(this, "TopicArn", {
+      value: galleryTopic.topicArn,
     });
   }
 }
