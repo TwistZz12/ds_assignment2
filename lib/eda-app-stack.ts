@@ -116,6 +116,7 @@ export class EDAAppStack extends cdk.Stack {
         entry: `${__dirname}/../lambdas/statusMailer.ts`,
         environment: {
           TABLE_NAME: imageTable.tableName,
+          SENDER_EMAIL: "noreply@example.com",
         },
       }
     );
@@ -128,8 +129,11 @@ export class EDAAppStack extends cdk.Stack {
     galleryTopic.addSubscription(
       new subs.SqsSubscription(imageProcessQueue, {
         filterPolicy: {
-          eventType: sns.SubscriptionFilter.stringFilter({
-            allowlist: ["ObjectCreated:Put", "ObjectCreated:Post"],
+          eventSource: sns.SubscriptionFilter.stringFilter({
+            allowlist: ["aws:s3"],
+          }),
+          eventName: sns.SubscriptionFilter.stringFilter({
+            allowlist: ["ObjectCreated:Put", "ObjectCreated:Post", "ObjectCreated:CompleteMultipartUpload"],
           }),
         },
       })
@@ -138,9 +142,7 @@ export class EDAAppStack extends cdk.Stack {
     galleryTopic.addSubscription(
       new subs.LambdaSubscription(addMetadataFn, {
         filterPolicy: {
-          "metadata_type": sns.SubscriptionFilter.stringFilter({
-            allowlist: ["Caption", "Date", "name"],
-          }),
+          "metadata_type": sns.SubscriptionFilter.existsFilter(),
         },
       })
     );
@@ -148,7 +150,15 @@ export class EDAAppStack extends cdk.Stack {
     galleryTopic.addSubscription(
       new subs.LambdaSubscription(updateStatusFn, {
         filterPolicy: {
-          "MessageAttributes.update": sns.SubscriptionFilter.existsFilter(),
+          "update": sns.SubscriptionFilter.existsFilter(),
+        },
+      })
+    );
+
+    galleryTopic.addSubscription(
+      new subs.SqsSubscription(mailerQueue, {
+        filterPolicy: {
+          "update.status": sns.SubscriptionFilter.existsFilter(),
         },
       })
     );
@@ -171,16 +181,6 @@ export class EDAAppStack extends cdk.Stack {
       new events.SqsEventSource(mailerQueue, {
         batchSize: 5,
         maxBatchingWindow: cdk.Duration.seconds(5),
-      })
-    );
-
-    galleryTopic.addSubscription(
-      new subs.SqsSubscription(mailerQueue, {
-        filterPolicy: {
-          "MessageAttributes.status": sns.SubscriptionFilter.stringFilter({
-            allowlist: ["Pass", "Reject"],
-          }),
-        },
       })
     );
 
@@ -213,6 +213,10 @@ export class EDAAppStack extends cdk.Stack {
 
     new cdk.CfnOutput(this, "TopicArn", {
       value: galleryTopic.topicArn,
+    });
+
+    new cdk.CfnOutput(this, "DLQName", {
+      value: imageProcessDLQ.queueName,
     });
   }
 }
