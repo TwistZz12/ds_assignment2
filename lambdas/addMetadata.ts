@@ -17,7 +17,6 @@ export const handler = async (event: SNSEvent) => {
       const imageId = messageBody.id;
       const value = messageBody.value;
       
-      // Get metadata type from message attribute
       const metadataType = record.Sns.MessageAttributes.metadata_type?.Value;
       
       if (!imageId) {
@@ -35,7 +34,6 @@ export const handler = async (event: SNSEvent) => {
         continue;
       }
       
-      // Check if the image exists in DynamoDB
       const getParams = {
         TableName: tableName,
         Key: {
@@ -52,7 +50,6 @@ export const handler = async (event: SNSEvent) => {
       
       console.log(`Adding ${metadataType} metadata to image: ${imageId}`);
       
-      // Update DynamoDB with the metadata
       const updateParams = {
         TableName: tableName,
         Key: {

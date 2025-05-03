@@ -127,16 +127,7 @@ export class EDAAppStack extends cdk.Stack {
     );
 
     galleryTopic.addSubscription(
-      new subs.SqsSubscription(imageProcessQueue, {
-        filterPolicy: {
-          eventSource: sns.SubscriptionFilter.stringFilter({
-            allowlist: ["aws:s3"],
-          }),
-          eventName: sns.SubscriptionFilter.stringFilter({
-            allowlist: ["ObjectCreated:Put", "ObjectCreated:Post", "ObjectCreated:CompleteMultipartUpload"],
-          }),
-        },
-      })
+      new subs.SqsSubscription(imageProcessQueue)
     );
 
     galleryTopic.addSubscription(
@@ -184,7 +175,7 @@ export class EDAAppStack extends cdk.Stack {
       })
     );
 
-    imagesBucket.grantRead(logImageFn);
+    imagesBucket.grantReadWrite(logImageFn);
     imagesBucket.grantReadWrite(removeImageFn);
     imageTable.grantReadWriteData(logImageFn);
     imageTable.grantReadWriteData(addMetadataFn);
@@ -200,6 +191,18 @@ export class EDAAppStack extends cdk.Stack {
           "ses:SendTemplatedEmail",
         ],
         resources: ["*"],
+      })
+    );
+
+    logImageFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: [
+          'sqs:ReceiveMessage',
+          'sqs:DeleteMessage',
+          'sqs:GetQueueAttributes'
+        ],
+        resources: [imageProcessQueue.queueArn]
       })
     );
 
